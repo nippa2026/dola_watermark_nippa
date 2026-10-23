@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watermark Cleaner</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--ink:#16181d;--mute:#667085;--line:#e3e6eb;--accent:#2f6bff;--accent-ink:#fff;--ok:#12805c;--bad:#c0362c}
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#171a21;--ink:#eceef2;--mute:#9aa3b2;--line:#2a2f3a;--accent:#5b8cff;--accent-ink:#0b0d12;--ok:#3fcf9b;--bad:#ff7a6e}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  main{max-width:640px;margin:0 auto;padding:24px 16px 64px}
+  h1{font-size:1.5rem;margin:0 0 4px}
+  p.sub{color:var(--mute);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:16px}
+  label{display:block;font-size:.85rem;color:var(--mute);margin:10px 0 4px}
+  input[type=text],input[type=password]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:transparent;color:var(--ink);font:inherit}
+  .check{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:.9rem;color:var(--mute)}
+  #drop{border:2px dashed var(--line);border-radius:14px;padding:32px 16px;text-align:center;color:var(--mute);cursor:pointer}
+  #drop.over{border-color:var(--accent);color:var(--ink)}
+  button{font:inherit;border:0;border-radius:10px;padding:10px 16px;background:var(--accent);color:var(--accent-ink);cursor:pointer}
+  button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:default}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  #status{margin-top:12px;font-size:.95rem}
+  #status.ok{color:var(--ok)} #status.bad{color:var(--bad)}
+  progress{width:100%;height:8px;margin-top:10px}
+  video{width:100%;max-height:60vh;border-radius:10px;background:#000;margin-top:12px}
+  small{color:var(--mute)}
+  pre{white-space:pre-wrap;font-size:.8rem;background:var(--bg);padding:10px;border-radius:8px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Watermark Cleaner</h1>
+  <p class="sub">Upload a Dola AI video, wait a few minutes, download the cleaned copy.</p>
+
+  <section class="card">
+    <label for="repo">Your repository (owner/name)</label>
+    <input id="repo" type="text" placeholder="yourname/watermark-remover" autocomplete="off" spellcheck="false">
+    <label for="token">GitHub token (fine-grained, Contents: read &amp; write on that repo only)</label>
+    <input id="token" type="password" placeholder="github_pat_..." autocomplete="off">
+    <div class="check"><input id="remember" type="checkbox"><label for="remember" style="margin:0">Remember on this device</label></div>
+  </section>
+
+  <section class="card">
+    <div id="drop" tabindex="0" role="button">Drop a video here, or tap to choose<br><small>mp4 / mov / webm, up to about 90&nbsp;MB</small></div>
+    <input id="file" type="file" accept="video/*,.mp4,.mov,.webm,.m4v" hidden>
+    <progress id="prog" value="0" max="1" hidden></progress>
+    <div id="status" role="status"></div>
+    <div id="result" hidden>
+      <video id="player" controls playsinline></video>
+      <div class="row">
+        <button id="dl">Download cleaned video</button>
+        <button id="del" class="ghost">Delete my files from the repo</button>
+      </div>
+    </div>
+  </section>
+  <small>Files go to your own GitHub repo and are processed by GitHub Actions. Use a private repo.</small>
+</main>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const MAX=90*1024*1024, POLL_MS=10000, POLL_MAX=180;
+  const store={
+    get(k){try{return localStorage.getItem(k)||""}catch(e){return ""}},
+    set(k,v){try{localStorage.setItem(k,v)}catch(e){}},
+    del(k){try{localStorage.removeItem(k)}catch(e){}}
+  };
+  $("repo").value=store.get("wc_repo");
+  if(store.get("wc_token")){$("token").value=store.get("wc_token");$("remember").checked=true}
+
+  let current=null, blobUrl=null, timer=null;
+
+  function say(msg,cls){const s=$("status");s.textContent=msg;s.className=cls||""}
+  function creds(){
+    const repo=$("repo").value.trim().replace(/^https?:\/\/github\.com\//,"").replace(/\/$/,"");
+    const token=$("token").value.trim();
+    if(!/^[\w.-]+\/[\w.-]+$/.test(repo)){say("Enter the repository as owner/name.","bad");return null}
+    if(!token){say("Paste your GitHub token first.","bad");return null}
+    store.set("wc_repo",repo);
+    if($("remember").checked)store.set("wc_token",token);else store.del("wc_token");
+    return {repo,token};
+  }
+  function api(c,path,opts,raw){
+    opts=opts||{};
+    return fetch("https://api.github.com/repos/"+c.repo+"/contents/"+path,{
+      method:opts.method||"GET",
+      headers:Object.assign({
+        "Authorization":"Bearer "+c.token,
+        "Accept":raw?"application/vnd.github.raw":"application/vnd.github+json",
+        "X-GitHub-Api-Version":"2022-11-28"
+      },opts.body?{"Content-Type":"application/json"}:{}),
+      body:opts.body?JSON.stringify(opts.body):undefined
+    });
+  }
+  function toBase64(file){
+    return new Promise((res,rej)=>{
+      const r=new FileReader();
+      r.onload=()=>res(String(r.result).split(",")[1]);
+      r.onerror=()=>rej(r.error);
+      r.readAsDataURL(file);
+    });
+  }
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+  async function handle(file){
+    const c=creds(); if(!c||!file)return;
+    reset();
+    if(file.size>MAX){say("That file is over 90 MB, which GitHub's upload limit does not allow.","bad");return}
+    const ext=(file.name.match(/\.(\w{2,5})$/)||[,"mp4"])[1].toLowerCase();
+    const safe=file.name.replace(/\.\w+$/,"").replace(/[^\w-]+/g,"_").slice(0,40)||"video";
+    const id=Date.now()+"-"+safe;
+    current={c,id};
+    $("prog").hidden=false;$("prog").removeAttribute("value");
+    say("Uploading "+Math.round(file.size/1048576)+" MB...");
+    try{
+      const content=await toBase64(file);
+      const r=await api(c,"input/"+id+"."+ext,{method:"PUT",body:{message:"Add "+id,content}});
+      if(!r.ok){
+        const t=await r.text().catch(()=>"");
+        throw new Error(r.status===401||r.status===403?"GitHub refused the token (check it has Contents read & write on this repo).":r.status===404?"Repository not found, or the token cannot see it.":"Upload failed ("+r.status+"). "+t.slice(0,150));
+      }
+      await poll();
+    }catch(e){say(e.message||String(e),"bad")}
+    $("prog").hidden=true;
+  }
+
+  async function poll(){
+    const {c,id}=current;
+    for(let i=0;i<POLL_MAX;i++){
+      say("Processing on GitHub... "+Math.floor(i*POLL_MS/60000)+" min so far. This usually takes several minutes.");
+      await sleep(POLL_MS);
+      let r=await api(c,"output/"+id+"_clean.mp4");
+      if(r.ok){await showResult();return}
+      r=await api(c,"output/"+id+"_error.txt",{},true);
+      if(r.ok){say("Processing failed:","bad");const p=document.createElement("pre");p.textContent=await r.text();$("status").appendChild(p);return}
+    }
+    say("Still not finished after 30 minutes. Check the Actions tab of your repo.","bad");
+  }
+
+  async function showResult(){
+    const {c,id}=current;
+    say("Done. Loading the cleaned video...","ok");
+    const r=await api(c,"output/"+id+"_clean.mp4",{},true);
+    if(!r.ok){say("Finished, but the download failed ("+r.status+").","bad");return}
+    const blob=await r.blob();
+    blobUrl=URL.createObjectURL(blob);
+    $("player").src=blobUrl;
+    $("result").hidden=false;
+    say("Done. Your cleaned video is ready.","ok");
+  }
+
+  function reset(){
+    $("result").hidden=true;
+    $("player").removeAttribute("src");
+    if(blobUrl){URL.revokeObjectURL(blobUrl);blobUrl=null}
+  }
+
+  $("dl").onclick=()=>{
+    if(!blobUrl||!current)return;
+    const a=document.createElement("a");
+    a.href=blobUrl;a.download=current.id+"_clean.mp4";
+    document.body.appendChild(a);a.click();a.remove();
+  };
+
+  async function remove(c,path){
+    const g=await api(c,path);
+    if(!g.ok)return;
+    const j=await g.json();
+    await api(c,path,{method:"DELETE",body:{message:"Delete "+path,sha:j.sha}});
+  }
+  $("del").onclick=async()=>{
+    if(!current)return;
+    const {c,id}=current;
+    say("Deleting...");
+    await remove(c,"output/"+id+"_clean.mp4");
+    await remove(c,"output/"+id+"_error.txt");
+    say("Deleted from the repo's current files. Git history may still hold a copy; delete the repo to be sure.","ok");
+  };
+
+  const drop=$("drop"),inp=$("file");
+  drop.onclick=()=>inp.click();
+  drop.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();inp.click()}};
+  inp.onchange=()=>{if(inp.files[0])handle(inp.files[0]);inp.value=""};
+  ["dragenter","dragover"].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.add("over")}));
+  ["dragleave","drop"].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove("over")}));
+  drop.addEventListener("drop",e=>{const f=e.dataTransfer.files[0];if(f)handle(f)});
+})();
+</script>
+</body>
+</html>
